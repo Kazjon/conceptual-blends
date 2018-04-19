@@ -1,6 +1,6 @@
 # rnn_model
 
-It containes the tensorflow graph for sketch classification RNN model obtained from: https://www.tensorflow.org/versions/master/tutorials/recurrent_quickdraw
+It contains the tensorflow graph for sketch classification RNN model obtained from: https://www.tensorflow.org/versions/master/tutorials/recurrent_quickdraw
 
 # contextual-sketch
 
