@@ -1,19 +1,25 @@
-import tensorflow as tf
-import numpy as np
+"""Training script for conditional seq2seq sketch model."""
+from __future__ import division
 
-from random import sample, shuffle, randint
-
+import os
 import sys
+from random import shuffle, randint
+
+import numpy as np
+import tensorflow as tf
+
+from rnn_model import rnn_model
+
+N_CLASSES = 345
 
 
 def rand_batch_gen(dataset):
-    n_class = 345
+    """Old batch generation."""
     while True:  # use try catch here; just repeat idx=.. and batch=...
         idx = randint(0, len(dataset)-1)  # choose a random batch id
-        ys_ = np.zeros(n_class)  # output
-        ys_[randint(0, n_class)] = 1
-        br = ys_
-        yield dataset[idx][np.newaxis, :], ys_, br
+        ys_ = np.full((1, ), randint(0, N_CLASSES))  # output
+        br_ = ys_
+        yield dataset[idx][np.newaxis, :], ys_, br_
 
 
 def pad_sequences(sequences):
@@ -38,10 +44,10 @@ def gen_batches(data, batch_size=8, randomize=False):
         yield pad_sequences(data[indices[start:start + batch_size]])
 
 
-def split_dataset(samples, ratio=[0.8, 0.2]):
-
+def split_dataset(samples, ratio=0.8):
+    """Split dataset randomly in train and test set."""
     nsamples = len(samples)
-    num_train = int(ratio[0]*nsamples)
+    num_train = int(ratio*nsamples)
 
     # shuffle samples
     shuffle(samples)
@@ -62,156 +68,152 @@ def build_lstm_cell(size, keep_prob=None):
     return encoder_cell
 
 
+def decode_state(cells, weights, b_o):
+    """Converts the LSTM state to a sketch coordinate."""
+    return tf.tensordot(cells, weights, axes=1) + b_o
+
+
 class contextual_seq2seq(object):
 
-    def __init__(self, state_size, vocab_size, num_layers,
-                 ext_context_size,
+    def __graph__(self, state_size, vocab_size, num_layers, ext_context_size):
+        """build network graph"""
+        tf.reset_default_graph()
+
+        # placeholders
+        xs_ = tf.placeholder(dtype=tf.float32,
+                             shape=[None, None, vocab_size], name='xs')
+        ys_ = tf.placeholder(dtype=tf.int32, shape=[None, ],
+                             name='ys')  # decoder targets
+        dec_inputs_length_ = tf.placeholder(dtype=tf.int32, shape=[None, ],
+                                            name='dec_inputs_length')
+        ext_context_ = tf.placeholder(dtype=tf.float32, shape=[None, ],
+                                      name='ext_context')
+
+        # dropout probability (shared)
+        keep_prob_ = tf.placeholder(tf.float32)
+
+        # stack cells
+        sizes = [vocab_size] + [state_size]*(num_layers - 1)
+        encoder_cell = tf.contrib.rnn.MultiRNNCell(
+            [build_lstm_cell(size, keep_prob_) for size in sizes],
+            state_is_tuple=True)
+
+        with tf.variable_scope('encoder') as scope:
+            # define encoder
+            _, enc_context = tf.nn.dynamic_rnn(
+                cell=encoder_cell, dtype=tf.float32, inputs=xs_)
+
+        # output projection
+        V = tf.get_variable(
+            'V', shape=[state_size, vocab_size],
+            initializer=tf.contrib.layers.xavier_initializer())
+        b_o = tf.get_variable('bo', shape=[vocab_size],
+                              initializer=tf.constant_initializer(0.))
+
+        # embedding for pad symbol
+        pad = tf.zeros(shape=(tf.shape(xs_)[0], vocab_size), dtype=tf.float32)
+
+        def loop_fn_initial(time, cell_output, cell_state, loop_state):
+            """init function for raw_rnn"""
+            assert cell_output is None
+            assert loop_state is None
+            assert cell_state is None
+
+            return ((time >= dec_inputs_length_),  # elements_finished
+                    pad,                           # initial_input
+                    enc_context,                   # initial_cell_state
+                    None,                          # emit_output
+                    None)                          # initial_loop_state
+
+        def loop_fn(time, cell_output, cell_state, loop_state):
+            """state transition function for raw_rnn"""
+            if cell_state is None:    # time == 0
+                return loop_fn_initial(
+                    time, cell_output, cell_state, loop_state)
+
+            emit_output = cell_output  # == None for time == 0
+
+            # couple external context with cell states (c, h)
+            next_cell_state = []
+            for layer in range(num_layers):
+                next_cell_state.append(tf.contrib.rnn.LSTMStateTuple(
+                    c=cell_state[layer].c + ext_context_,
+                    h=cell_state[layer].h + ext_context_))
+
+            next_cell_state = tuple(next_cell_state)
+
+            elements_finished = (time >= dec_inputs_length_)
+            finished = tf.reduce_all(elements_finished)
+
+            # TODO: the current code computes an intermediate generated
+            #   sequence for conditioning purposes: is it what we want?
+            next_input = tf.cond(finished,
+                                 lambda: pad,
+                                 lambda: decode_state(cell_output, V, b_o))
+
+            next_loop_state = None
+
+            return (elements_finished,
+                    next_input,
+                    next_cell_state,
+                    emit_output,
+                    next_loop_state)
+
+        # define the decoder with raw_rnn <- loop_fn, loop_fn_initial
+        sizes = [vocab_size] + [state_size]*(num_layers - 1)
+        decoder_cell = tf.contrib.rnn.MultiRNNCell(
+            [build_lstm_cell(size) for size in sizes],
+            state_is_tuple=True)
+
+        with tf.variable_scope('decoder') as scope:
+            decoder_outputs_ta, _, _ = tf.nn.raw_rnn(decoder_cell, loop_fn)
+            decoder_outputs = decoder_outputs_ta.stack()
+
+        # flatten states to 2d matrix for matmult with V
+        added_strokes = decode_state(decoder_outputs, V, b_o)
+        predictions = tf.concat([xs_, added_strokes], axis=1)
+
+        logits = rnn_model(predictions)
+
+        # optimization
+        losses = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits,
+                                                                labels=ys_)
+        loss = tf.reduce_mean(losses)
+        train_op = tf.train.AdagradOptimizer(learning_rate=0.1).minimize(loss)
+
+        # attach symbols to class
+        self.loss = loss
+        self.train_op = train_op
+        self.predictions = predictions
+        self.ext_context_size = ext_context_size
+        self.keep_prob_ = keep_prob_  # placeholders
+        self.xs_ = xs_
+        self.ys_ = ys_
+        self.dec_inputs_length_ = dec_inputs_length_
+        self.ext_context_ = ext_context_
+
+    def __init__(self, state_size, vocab_size, num_layers, ext_context_size,
                  model_name='contextual_seq2seq',
                  ckpt_path='ckpt/contextual_seq2seq/'):
 
         self.model_name = model_name
         self.ckpt_path = ckpt_path
 
-        def __graph__():
-            """build network graph"""
-            tf.reset_default_graph()
+        if not os.path.isdir(ckpt_path):
+            os.makedirs(ckpt_path)
 
-            # placeholders
-            xs_ = tf.placeholder(dtype=tf.float32,
-                                 shape=[None, None, vocab_size], name='xs')
-            ys_ = tf.placeholder(dtype=tf.float32, shape=[None, ],
-                                 name='ys')  # decoder targets
-            dec_inputs_length_ = tf.placeholder(dtype=tf.int32, shape=[None, ],
-                                                name='dec_inputs_length')
-            ext_context_ = tf.placeholder(dtype=tf.float32, shape=[None, ],
-                                          name='ext_context')
-
-            # dropout probability (shared)
-            keep_prob_ = tf.placeholder(tf.float32)
-
-            # stack cells
-            sizes = [vocab_size] + [state_size]*(num_layers - 1)
-            encoder_cell = tf.contrib.rnn.MultiRNNCell(
-                [build_lstm_cell(size, keep_prob_) for size in sizes],
-                state_is_tuple=True)
-
-            with tf.variable_scope('encoder') as scope:
-                # define encoder
-                enc_op, enc_context = tf.nn.dynamic_rnn(
-                    cell=encoder_cell, dtype=tf.float32, inputs=xs_)
-
-            # output projection
-            V = tf.get_variable(
-                'V', shape=[state_size, vocab_size],
-                initializer=tf.contrib.layers.xavier_initializer())
-            bo = tf.get_variable('bo', shape=[vocab_size],
-                                 initializer=tf.constant_initializer(0.))
-
-            ###
-            # embedding for pad symbol
-            pad = tf.zeros(shape=(tf.shape(xs_)[0], ), dtype=tf.float32)
-
-            ###
-            # init function for raw_rnn
-            def loop_fn_initial(time, cell_output, cell_state, loop_state):
-                assert cell_output is None
-                assert loop_state is None
-                assert cell_state is None
-
-                elements_finished = (time >= dec_inputs_length_)
-                initial_input = pad
-                initial_cell_state = enc_context
-                initial_loop_state = None
-
-                return (elements_finished,
-                        initial_input,
-                        initial_cell_state,
-                        None,
-                        initial_loop_state)
-
-            ###
-            # state transition function for raw_rnn
-            def loop_fn(time, cell_output, cell_state, loop_state):
-
-                if cell_state is None:    # time == 0
-                    return loop_fn_initial(
-                        time, cell_output, cell_state, loop_state)
-
-                emit_output = cell_output  # == None for time == 0
-                #
-                # couple external context with cell states (c, h)
-                next_cell_state = []
-                for layer in range(num_layers):
-                    next_cell_state.append(tf.contrib.rnn.LSTMStateTuple(
-                        c=cell_state[layer].c + ext_context_,
-                        h=cell_state[layer].h + ext_context_))
-
-                next_cell_state = tuple(next_cell_state)
-
-                elements_finished = (time >= dec_inputs_length_)
-                finished = tf.reduce_all(elements_finished)
-
-                def search_for_next_input():
-                    output = tf.matmul(cell_output, V) + bo
-                    return tf.argmax(output, axis=1)
-                
-                next_input = tf.cond(finished,
-                                     lambda: pad, search_for_next_input)
-
-                next_loop_state = None
-
-                return (elements_finished,
-                        next_input,
-                        next_cell_state,
-                        emit_output,
-                        next_loop_state)
-
-            ###
-            # define the decoder with raw_rnn <- loop_fn, loop_fn_initial
-            decoder_cell = tf.contrib.rnn.MultiRNNCell(
-                [build_lstm_cell(state_size) for _ in range(num_layers)],
-                state_is_tuple=True)
-
-            with tf.variable_scope('decoder') as scope:
-                decoder_outputs_ta, _, _ = tf.nn.raw_rnn(decoder_cell, loop_fn)
-                decoder_outputs = decoder_outputs_ta.stack()
-
-            ####
-            # flatten states to 2d matrix for matmult with V
-            dec_op_reshaped = tf.reshape(decoder_outputs, [-1, state_size])
-            # /\_o^o_/\
-            logits = tf.matmul(dec_op_reshaped, V) + bo
-            #
-            # predictions
-            predictions = tf.nn.softmax(logits)
-            #
-            # optimization
-            losses = tf.nn.sparse_softmax_cross_entropy_with_logits(
-                logits=logits, labels=tf.reshape(ys_, [-1]))
-            loss = tf.reduce_mean(losses)
-            train_op = tf.train.AdagradOptimizer(
-                learning_rate=0.1).minimize(loss)
-            #
-            # attach symbols to class
-            self.loss = loss
-            self.train_op = train_op
-            self.predictions = predictions
-            self.ext_context_size = ext_context_size
-            self.keep_prob_ = keep_prob_  # placeholders
-            self.xs_ = xs_
-            self.ys_ = ys_
-            self.dec_inputs_length_ = dec_inputs_length_
-            self.ext_context_ = ext_context_
-            #####
-        ####
         # build graph
-        __graph__()
+        self.__graph__(state_size, vocab_size, num_layers, ext_context_size)
 
-    def train(self, trainset, testset, n, epochs):
+    def train(self, trainset, testset, niter=1000, ntest=300, epochs=int(1e6)):
+        """Train using niter iterations per epoch and for the given number of
+        epochs."""
 
         print('\n>> Training begins!\n')
 
         def fetch_dict(datagen, keep_prob=0.5):
+            """Format model input data."""
+            bx, by, br = next(datagen)
             while not (bx.shape[0] > 0 and bx.shape[1] > 0):
                 bx, by, br = next(datagen)
 
@@ -241,23 +243,23 @@ class contextual_seq2seq(object):
             # start training
             for j in range(epochs):
                 mean_loss = 0
-                for i in range(n):
-                    _, l = sess.run([self.train_op, self.loss],
-                                    feed_dict=fetch_dict(trainset))
-                    mean_loss += l
-                    sys.stdout.write('[{}/{}]\r'.format(i, n))
+                for n_it in range(niter):
+                    _, loss = sess.run([self.train_op, self.loss],
+                                       feed_dict=fetch_dict(trainset))
+                    mean_loss += loss
+                    print('  [{}/{}]\r'.format(n_it, niter))
 
-                print('\n>> [{}] train loss at : {}'.format(j, mean_loss/n))
+                print('[{}] train loss : {}'.format(j, mean_loss / niter))
                 saver.save(sess, self.ckpt_path + self.model_name + '.ckpt',
-                           global_step=i)
-                #
+                           global_step=j)
+
                 # evaluate
                 testloss = 0
-                for k in range(300):
+                for _ in range(ntest):
                     testloss += sess.run(
                         [self.loss],
                         feed_dict=fetch_dict(testset, keep_prob=1.))[0]
-                print('test loss : {}'.format(testloss / 300))
+                print('test loss : {}'.format(testloss / ntest))
 
         except KeyboardInterrupt:
             print('\n>> Interrupted by user at iteration {}'.format(j))
@@ -265,7 +267,6 @@ class contextual_seq2seq(object):
 
 def main():
     """Script entry point"""
-    # gather data
     with np.load('rainbow_data.npz', encoding='latin1') as fid:
         # split into batches
         data_ = fid['arr_0']
@@ -278,16 +279,11 @@ def main():
     trainset = rand_batch_gen(traindata)
     testset = rand_batch_gen(testdata)
 
-    ###
-    # infer vocab size
-    # vocab_size = len(metadata['idx2w'])
-    # ext_context_size = metadata['respect_size']
-    #
     # create a model
     model = contextual_seq2seq(state_size=1024, vocab_size=3,
                                num_layers=3, ext_context_size=1)
     # train
-    model.train(trainset, testset, n=1000, epochs=1000000)
+    model.train(trainset, testset, niter=10, ntest=3, epochs=100)
 
 
 if __name__ == '__main__':

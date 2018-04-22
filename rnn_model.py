@@ -97,7 +97,7 @@ def rnn_model(features, num_classes=N_CLASSES, params=None, is_training=False):
       features: dictionary with keys: inks, lengths.
       num_classes: number of classes
       params: a parameter dictionary with the following keys: num_layers,
-        num_nodes, batch_size, num_conv, conv_len, num_classes.
+        num_nodes, batch_size, num_conv, conv_len.
       is_training: True when training the model
 
     Returns:
@@ -113,4 +113,4 @@ def rnn_model(features, num_classes=N_CLASSES, params=None, is_training=False):
     final_state = _add_rnn_layers(features, lengths, params)
     logits = tf.layers.dense(final_state, num_classes)
 
-    return final_state
+    return logits
