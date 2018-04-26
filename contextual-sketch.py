@@ -2,7 +2,6 @@
 from __future__ import division
 
 import os
-import sys
 from random import shuffle, randint
 
 import numpy as np
@@ -86,16 +85,17 @@ class contextual_seq2seq(object):
                              name='ys')  # decoder targets
         dec_inputs_length_ = tf.placeholder(dtype=tf.int32, shape=[None, ],
                                             name='dec_inputs_length')
-        ext_context_ = tf.placeholder(dtype=tf.float32, shape=[None, ],
+        ext_context_ = tf.placeholder(dtype=tf.int32, shape=[None, ],
                                       name='ext_context')
 
         # dropout probability (shared)
         keep_prob_ = tf.placeholder(tf.float32)
 
         # stack cells
-        sizes = [vocab_size] + [state_size]*(num_layers - 1)
+        sizes = [state_size]*num_layers
         encoder_cell = tf.contrib.rnn.MultiRNNCell(
-            [build_lstm_cell(size, keep_prob_) for size in sizes],
+            [build_lstm_cell(size, keep_prob_)
+             for size in [state_size]*num_layers],
             state_is_tuple=True)
 
         with tf.variable_scope('encoder') as scope:
@@ -107,8 +107,19 @@ class contextual_seq2seq(object):
         V = tf.get_variable(
             'V', shape=[state_size, vocab_size],
             initializer=tf.contrib.layers.xavier_initializer())
-        b_o = tf.get_variable('bo', shape=[vocab_size],
+        b_o = tf.get_variable('bo', shape=[vocab_size, ],
                               initializer=tf.constant_initializer(0.))
+
+        # class embedding
+        class_proj = tf.get_variable(
+            'C', shape=[N_CLASSES, state_size],
+            initializer=tf.contrib.layers.xavier_initializer())
+        c_o = tf.get_variable('co', shape=[state_size, ],
+                              initializer=tf.constant_initializer(0.))
+
+        context_proj = tf.one_hot(ext_context_, N_CLASSES,
+                                  on_value=1.0, off_value=0.0)
+        context_proj = tf.tensordot(context_proj, class_proj, axes=1) + c_o
 
         # embedding for pad symbol
         pad = tf.zeros(shape=(tf.shape(xs_)[0], vocab_size), dtype=tf.float32)
@@ -137,8 +148,8 @@ class contextual_seq2seq(object):
             next_cell_state = []
             for layer in range(num_layers):
                 next_cell_state.append(tf.contrib.rnn.LSTMStateTuple(
-                    c=cell_state[layer].c + ext_context_,
-                    h=cell_state[layer].h + ext_context_))
+                    c=cell_state[layer].c + context_proj,
+                    h=cell_state[layer].h + context_proj))
 
             next_cell_state = tuple(next_cell_state)
 
@@ -147,9 +158,9 @@ class contextual_seq2seq(object):
 
             # TODO: the current code computes an intermediate generated
             #   sequence for conditioning purposes: is it what we want?
-            next_input = tf.cond(finished,
-                                 lambda: pad,
-                                 lambda: decode_state(cell_output, V, b_o))
+            out = decode_state(cell_output, V, b_o)
+            out.set_shape([None, vocab_size])
+            next_input = tf.cond(finished, lambda: pad, lambda: out)
 
             next_loop_state = None
 
@@ -160,9 +171,8 @@ class contextual_seq2seq(object):
                     next_loop_state)
 
         # define the decoder with raw_rnn <- loop_fn, loop_fn_initial
-        sizes = [vocab_size] + [state_size]*(num_layers - 1)
         decoder_cell = tf.contrib.rnn.MultiRNNCell(
-            [build_lstm_cell(size) for size in sizes],
+            [build_lstm_cell(size) for size in [state_size]*num_layers],
             state_is_tuple=True)
 
         with tf.variable_scope('decoder') as scope:
@@ -171,7 +181,7 @@ class contextual_seq2seq(object):
 
         # flatten states to 2d matrix for matmult with V
         added_strokes = decode_state(decoder_outputs, V, b_o)
-        predictions = tf.concat([xs_, added_strokes], axis=1)
+        predictions = added_strokes  # tf.concat([xs_, added_strokes], axis=1)
 
         logits = rnn_model(predictions)
 
