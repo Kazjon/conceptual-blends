@@ -16,7 +16,7 @@ def rand_batch_gen(dataset):
     """Old batch generation."""
     while True:  # use try catch here; just repeat idx=.. and batch=...
         idx = randint(0, len(dataset)-1)  # choose a random batch id
-        ys_ = np.full((1, ), randint(0, N_CLASSES))  # output
+        ys_ = np.array([randint(0, N_CLASSES - 1)])  # output
         br_ = ys_
         yield dataset[idx][np.newaxis, :], ys_, br_
 
@@ -92,7 +92,6 @@ class contextual_seq2seq(object):
         keep_prob_ = tf.placeholder(tf.float32)
 
         # stack cells
-        sizes = [state_size]*num_layers
         encoder_cell = tf.contrib.rnn.MultiRNNCell(
             [build_lstm_cell(size, keep_prob_)
              for size in [state_size]*num_layers],
@@ -103,19 +102,20 @@ class contextual_seq2seq(object):
             _, enc_context = tf.nn.dynamic_rnn(
                 cell=encoder_cell, dtype=tf.float32, inputs=xs_)
 
-        # output projection
-        V = tf.get_variable(
-            'V', shape=[state_size, vocab_size],
-            initializer=tf.contrib.layers.xavier_initializer())
-        b_o = tf.get_variable('bo', shape=[vocab_size, ],
-                              initializer=tf.constant_initializer(0.))
+        with tf.variable_scope('proj') as scope:
+            # output projection
+            V = tf.get_variable(
+                'V', shape=[state_size, vocab_size],
+                initializer=tf.contrib.layers.xavier_initializer())
+            b_o = tf.get_variable('bo', shape=[vocab_size, ],
+                                  initializer=tf.constant_initializer(0.))
 
-        # class embedding
-        class_proj = tf.get_variable(
-            'C', shape=[N_CLASSES, state_size],
-            initializer=tf.contrib.layers.xavier_initializer())
-        c_o = tf.get_variable('co', shape=[state_size, ],
-                              initializer=tf.constant_initializer(0.))
+            # class embedding
+            class_proj = tf.get_variable(
+                'C', shape=[N_CLASSES, state_size],
+                initializer=tf.contrib.layers.xavier_initializer())
+            c_o = tf.get_variable('co', shape=[state_size, ],
+                                  initializer=tf.constant_initializer(0.))
 
         context_proj = tf.one_hot(ext_context_, N_CLASSES,
                                   on_value=1.0, off_value=0.0)
@@ -183,13 +183,20 @@ class contextual_seq2seq(object):
         added_strokes = decode_state(decoder_outputs, V, b_o)
         predictions = added_strokes  # tf.concat([xs_, added_strokes], axis=1)
 
-        logits = rnn_model(predictions)
+        logits = rnn_model(predictions, num_classes=N_CLASSES)
 
         # optimization
         losses = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits,
                                                                 labels=ys_)
         loss = tf.reduce_mean(losses)
-        train_op = tf.train.AdagradOptimizer(learning_rate=0.1).minimize(loss)
+
+        # train only encoder / decoder
+        tvar = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "encoder")
+        tvar += tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "decoder")
+        tvar += tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "proj")
+
+        train_op = tf.train.AdamOptimizer(learning_rate=0.001).minimize(
+            loss, var_list=tvar)
 
         # attach symbols to class
         self.loss = loss
@@ -277,6 +284,8 @@ class contextual_seq2seq(object):
 
 def main():
     """Script entry point"""
+    np.random.seed(42)  # ensure deterministic results
+
     with np.load('rainbow_data.npz', encoding='latin1') as fid:
         # split into batches
         data_ = fid['arr_0']
