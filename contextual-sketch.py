@@ -2,6 +2,7 @@
 from __future__ import division
 
 import os
+from itertools import chain
 from random import shuffle, randint
 
 import numpy as np
@@ -9,7 +10,8 @@ import tensorflow as tf
 
 from rnn_model import rnn_model
 
-N_CLASSES = 345
+N_CLASSES = 345      # number of sketch classes
+SIM_STRENGHT = 1e-3  # how important is the similarity btw input and gen sketch
 
 
 def rand_batch_gen(dataset):
@@ -86,6 +88,13 @@ def decode_state(cells, weights, b_o):
 def map_to_scope(var_list):
     """Loads the given scoped variables from an unscoped checkpoint."""
     return {var.op.name.split('/', 1)[1]: var for var in var_list}
+
+
+def get_collections(scope_list):
+    """Return the variables from the given scopes."""
+    variables = [tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope)
+                 for scope in scope_list]
+    return list(chain(*variables))
 
 
 def load_classification_parameters(sess, ckpt_file, scope):
@@ -212,19 +221,22 @@ class contextual_seq2seq(object):
         # predictions = tf.concat([xs_, added_strokes], axis=1)
 
         with tf.variable_scope('class') as scope:
-            logits = rnn_model(predictions, num_classes=N_CLASSES)
+            logits, out_features = rnn_model(
+                predictions, num_classes=N_CLASSES)
+
+        with tf.variable_scope('feat') as scope:
+            _, in_features = rnn_model(xs_, num_classes=N_CLASSES)
 
         # optimization
         losses = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits,
                                                                 labels=ys_)
+        losses += SIM_STRENGHT * tf.nn.l2_loss(out_features - in_features)
         loss = tf.reduce_mean(losses)
 
         # train only encoder / decoder
-        tvar = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "encoder")
-        tvar += tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "decoder")
-        tvar += tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "proj")
+        tvar = get_collections(["encoder", "decoder", "proj"])
 
-        train_op = tf.train.AdamOptimizer(learning_rate=0.001).minimize(
+        train_op = tf.train.AdagradOptimizer(learning_rate=0.001).minimize(
             loss, var_list=tvar)
 
         # attach symbols to class
@@ -275,14 +287,16 @@ class contextual_seq2seq(object):
             return feed_dict
 
         # setup session
-        saver = tf.train.Saver()
         sess = tf.Session()
         sess.run(tf.global_variables_initializer())
 
         load_classification_parameters(
             sess, "models/model.ckpt-1500000", "class")
+        load_classification_parameters(
+            sess, "models/model.ckpt-1500000", "feat")
 
         # get last checkpoint
+        saver = tf.train.Saver(get_collections(["encoder", "decoder", "proj"]))
         ckpt = tf.train.get_checkpoint_state(self.ckpt_path)
         # verify it
         if ckpt and ckpt.model_checkpoint_path:

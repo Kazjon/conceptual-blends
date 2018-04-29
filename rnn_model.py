@@ -113,4 +113,4 @@ def rnn_model(features, num_classes=N_CLASSES, params=None, is_training=False):
     final_state = _add_rnn_layers(features, lengths, params)
     logits = tf.layers.dense(final_state, num_classes)
 
-    return logits
+    return logits, features
