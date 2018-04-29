@@ -38,11 +38,14 @@ def pad_sequences(sequences):
 def gen_batches(data, batch_size=8, randomize=False):
     """Creates batches in the format expacted by the RNN """
     indices = list(range(len(data)))
+    targets = [randint(0, N_CLASSES - 1) for _ in indices]  # random labels
     if randomize:
         shuffle(indices)
 
     for start in range(0, len(data), batch_size):
-        yield pad_sequences(data[indices[start:start + batch_size]])
+        labels = np.array(targets[start:start + batch_size])
+        yield (pad_sequences(data[indices[start:start + batch_size]]),
+               labels, labels)
 
 
 def split_dataset(samples, ratio=0.8):
@@ -71,8 +74,8 @@ def build_lstm_cell(size, keep_prob=None):
 
 def code_stroke_tags(predictions):
     """Converts the last feature dimension to 0 or 1 based on sign."""
-    # condition = predictions[:, :, -1:] > 0
-    condition = False  # set all to 0
+    condition = predictions[:, :, -1:] > 0
+    # condition = False  # set all to 0
     stroke_tags = tf.where(condition,
                            tf.ones_like(predictions[:, :, -1:]),
                            tf.zeros_like(predictions[:, :, -1:]))
@@ -178,10 +181,12 @@ class contextual_seq2seq(object):
 
             # couple external context with cell states (c, h)
             next_cell_state = []
+            # condition only at the first temporal step
+            context = context_proj if cell_output is None else 0.0
             for layer in range(num_layers):
                 next_cell_state.append(tf.contrib.rnn.LSTMStateTuple(
-                    c=cell_state[layer].c + context_proj,
-                    h=cell_state[layer].h + context_proj))
+                    c=cell_state[layer].c + context,
+                    h=cell_state[layer].h + context))
 
             next_cell_state = tuple(next_cell_state)
 
@@ -236,8 +241,15 @@ class contextual_seq2seq(object):
         # train only encoder / decoder
         tvar = get_collections(["encoder", "decoder", "proj"])
 
-        train_op = tf.train.AdagradOptimizer(learning_rate=0.001).minimize(
-            loss, var_list=tvar)
+        train_op = tf.contrib.layers.optimize_loss(
+            loss=loss,
+            global_step=tf.train.get_global_step(),
+            learning_rate=1e-3,
+            optimizer="Adam",
+            # some gradient clipping stabilizes training in the beginning.
+            clip_gradients=9.0,
+            summaries=["learning_rate", "loss", "gradients", "gradient_norm"],
+            variables=tvar)
 
         # attach symbols to class
         self.loss = loss
@@ -346,8 +358,8 @@ def main():
 
     # prepare train set generator
     # generators (iterators) everytime they give a new sample
-    trainset = rand_batch_gen(traindata)
-    testset = rand_batch_gen(testdata)
+    trainset = gen_batches(traindata, randomize=True)  # rand_batch_gen(traindata)
+    testset = gen_batches(testdata)  # rand_batch_gen(testdata)
 
     # create a model
     model = contextual_seq2seq(state_size=1024, vocab_size=3,
