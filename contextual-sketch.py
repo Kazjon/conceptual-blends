@@ -67,6 +67,17 @@ def build_lstm_cell(size, keep_prob=None):
     return encoder_cell
 
 
+def code_stroke_tags(predictions):
+    """Converts the last feature dimension to 0 or 1 based on sign."""
+    # condition = predictions[:, :, -1:] > 0
+    condition = False  # set all to 0
+    stroke_tags = tf.where(condition,
+                           tf.ones_like(predictions[:, :, -1:]),
+                           tf.zeros_like(predictions[:, :, -1:]))
+
+    return tf.concat([predictions[:, :, :-1], stroke_tags], axis=2)
+
+
 def decode_state(cells, weights, b_o):
     """Converts the LSTM state to a sketch coordinate."""
     return tf.tensordot(cells, weights, axes=1) + b_o
@@ -75,6 +86,13 @@ def decode_state(cells, weights, b_o):
 def map_to_scope(var_list):
     """Loads the given scoped variables from an unscoped checkpoint."""
     return {var.op.name.split('/', 1)[1]: var for var in var_list}
+
+
+def load_classification_parameters(sess, ckpt_file, scope):
+    """Load the variables of the classification model."""
+    class_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=scope)
+    class_saver = tf.train.Saver(var_list=map_to_scope(class_vars))
+    class_saver.restore(sess, ckpt_file)
 
 
 class contextual_seq2seq(object):
@@ -182,12 +200,12 @@ class contextual_seq2seq(object):
 
         with tf.variable_scope('decoder') as scope:
             decoder_outputs_ta, _, _ = tf.nn.raw_rnn(decoder_cell, loop_fn)
-            decoder_outputs = decoder_outputs_ta.stack()
+            decoder_outputs = tf.transpose(decoder_outputs_ta.stack(),
+                                           perm=[1, 0, 2])
 
-        # flatten states to 2d matrix for matmult with V
-        mask = tf.constant([[[1.0, 1.0, 0.0]]], dtype=tf.float32)
-        added_strokes = decode_state(decoder_outputs, V, b_o)
-        added_strokes = tf.multiply(added_strokes, mask)
+        # decode final states
+        added_strokes = code_stroke_tags(decode_state(decoder_outputs, V, b_o))
+
         # generate a whole new sequence
         predictions = added_strokes
         # .. or add the generated strokes
@@ -245,7 +263,7 @@ class contextual_seq2seq(object):
             while not (bx.shape[0] > 0 and bx.shape[1] > 0):
                 bx, by, br = next(datagen)
 
-            dec_lengths = np.full((bx.shape[0], ), by.shape[0], dtype=np.int32)
+            dec_lengths = np.full((bx.shape[0], ), bx.shape[1], dtype=np.int32)
 
             feed_dict = {
                 self.xs_: bx,
@@ -261,11 +279,8 @@ class contextual_seq2seq(object):
         sess = tf.Session()
         sess.run(tf.global_variables_initializer())
 
-        ckpt_file = "models/model.ckpt-1500000"
-        class_vars = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES,
-                                       scope='class')
-        class_saver = tf.train.Saver(var_list=map_to_scope(class_vars))
-        class_saver.restore(sess, ckpt_file)
+        load_classification_parameters(
+            sess, "models/model.ckpt-1500000", "class")
 
         # get last checkpoint
         ckpt = tf.train.get_checkpoint_state(self.ckpt_path)
